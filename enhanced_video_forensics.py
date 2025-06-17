@@ -22,11 +22,13 @@ import os
 import cv2
 import numpy as np
 import imagehash
-from PIL import Image
+from PIL import Image, ImageChops
+import io
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from skimage.metrics import structural_similarity as ssim
 from sklearn.preprocessing import RobustScaler
+from sklearn.cluster import KMeans
 from tqdm import tqdm
 import logging
 from datetime import datetime
@@ -57,6 +59,29 @@ def mad(data):
     median = np.median(data)
     diff = np.abs(data - median)
     return np.median(diff)
+
+def compute_ela_score(frame_rgb, quality=95):
+    """Menghitung skor Error Level Analysis (ELA) sederhana."""
+    pil_image = Image.fromarray(frame_rgb)
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format='JPEG', quality=quality)
+    buffer.seek(0)
+    compressed = Image.open(buffer)
+    diff = ImageChops.difference(pil_image, compressed)
+    diff_np = np.asarray(diff)
+    return np.mean(diff_np)
+
+def compute_sift_similarity(gray1, gray2, ratio=0.75):
+    """Menghitung kesamaan SIFT antar dua frame."""
+    sift = cv2.SIFT_create()
+    k1, d1 = sift.detectAndCompute(gray1, None)
+    k2, d2 = sift.detectAndCompute(gray2, None)
+    if d1 is None or d2 is None or len(k1) == 0 or len(k2) == 0:
+        return 0.0
+    bf = cv2.BFMatcher(cv2.NORM_L2)
+    matches = bf.knnMatch(d1, d2, k=2)
+    good = [m for m, n in matches if m.distance < ratio * n.distance]
+    return len(good) / float(max(len(k1), len(k2)))
 
 def detect_scene_transitions(frames, threshold=0.55):
     """Metode deteksi scene change berbasis histogram yang ringan dan cepat."""
@@ -103,6 +128,7 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
     # --- TAHAP 1: Ekstraksi Frame dan Fitur Dasar (Cepat) ---
     frames_rgb = []
     frame_hashes = []
+    ela_scores = []
     
     for _ in tqdm(range(total_frames), desc="Tahap 1: Ekstraksi Frame & pHash"):
         ret, frame = cap.read()
@@ -112,6 +138,7 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
         frames_rgb.append(frame_rgb)
         pil_image = Image.fromarray(frame_rgb)
         frame_hashes.append(imagehash.phash(pil_image))
+        ela_scores.append(compute_ela_score(frame_rgb))
     cap.release()
 
     if len(frames_rgb) < 2:
@@ -143,9 +170,11 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
     # --- TAHAP 3: Kalkulasi Metrik Antar Frame (Sequential) ---
     hamming_dists = []
     ssim_scores = []
-    ssim_diff_maps = {} 
+    ssim_diff_maps = {}
     flow_mags = []
     vgg_similarities = []
+    ela_diffs = []
+    sift_sims = []
     
     frames_gray = [cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) for f in frames_rgb]
 
@@ -169,16 +198,35 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
         cosine_sim = np.dot(feat1, feat2) / (norm1 * norm2) if norm1 > 0 and norm2 > 0 else 0.0
         vgg_similarities.append(cosine_sim)
 
+        # ELA difference
+        ela_diffs.append(abs(ela_scores[i-1] - ela_scores[i]))
+
+        # SIFT similarity
+        sift_sims.append(compute_sift_similarity(frames_gray[i-1], frames_gray[i]))
+
     # --- TAHAP 4: Analisis dan Deteksi Anomali ---
     logging.info("Tahap 4: Menganalisis anomali dan menggabungkan skor...")
     ssim_anomaly = 1 - np.array(ssim_scores)
     vgg_anomaly = 1 - np.array(vgg_similarities)
     flow_anomaly = np.array(flow_mags)
+    ela_anomaly = np.array(ela_diffs)
+    sift_anomaly = 1 - np.array(sift_sims)
 
     scaler = RobustScaler()
-    combined_metrics = np.column_stack([ssim_anomaly, vgg_anomaly, flow_anomaly])
+    combined_metrics = np.column_stack([
+        ssim_anomaly,
+        vgg_anomaly,
+        flow_anomaly,
+        ela_anomaly,
+        sift_anomaly
+    ])
     scaled_metrics = scaler.fit_transform(combined_metrics)
-    combined_anomaly_score = np.mean(scaled_metrics, axis=1)
+    kmeans = KMeans(n_clusters=2, random_state=42)
+    labels = kmeans.fit_predict(scaled_metrics)
+    centers = kmeans.cluster_centers_
+    dists = np.linalg.norm(scaled_metrics - centers[labels], axis=1)
+    anomaly_cluster = np.argmin(np.bincount(labels))
+    combined_anomaly_score = dists
     
     results = {
         'video_file': os.path.basename(video_path),
@@ -195,14 +243,16 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
     score_mad = mad(combined_anomaly_score)
     anomaly_threshold = score_median + 4.0 * score_mad if score_mad > 1e-5 else score_median + 1.0
 
-    suspicious_indices = np.where(combined_anomaly_score > anomaly_threshold)[0]
+    suspicious_indices = np.where(labels == anomaly_cluster)[0]
     for idx in suspicious_indices:
         if idx not in scene_changes:
             results['anomalies'][idx] = {
                 'score': combined_anomaly_score[idx],
                 'ssim': ssim_scores[idx],
                 'flow': flow_mags[idx],
-                'vgg_sim': vgg_similarities[idx]
+                'vgg_sim': vgg_similarities[idx],
+                'ela_diff': ela_diffs[idx],
+                'sift_sim': sift_sims[idx]
             }
 
     # --- TAHAP 5: Pelaporan ---
@@ -221,14 +271,29 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
         logging.warning(f"POTENSI DISKONTINUITAS (DELETION/INSERTION) TERDETEKSI: {len(results['anomalies'])} titik.")
         sorted_anomalies = sorted(results['anomalies'].items(), key=lambda item: item[1]['score'], reverse=True)
         for idx, details in sorted_anomalies[:5]:
-            logging.warning(f"  - Transisi Frame {idx} -> {idx+1} [Skor Anomali Gabungan: {details['score']:.2f}] (SSIM={details['ssim']:.2f}, Flow={details['flow']:.2f}, VGG-Sim={details['vgg_sim']:.2f})")
+            logging.warning(
+                f"  - Transisi Frame {idx} -> {idx+1} [Skor Anomali Gabungan: {details['score']:.2f}]"
+                f" (SSIM={details['ssim']:.2f}, Flow={details['flow']:.2f}, VGG-Sim={details['vgg_sim']:.2f},"
+                f" ELA-Diff={details['ela_diff']:.2f}, SIFT-Sim={details['sift_sim']:.2f})"
+            )
     
     # --- TAHAP 6: Visualisasi ---
-    plot_ultimate_dashboard(results, combined_anomaly_score, ssim_scores, flow_mags, vgg_similarities, frames_rgb, anomaly_threshold, ssim_diff_maps)
+    plot_ultimate_dashboard(
+        results,
+        combined_anomaly_score,
+        ssim_scores,
+        flow_mags,
+        vgg_similarities,
+        ela_diffs,
+        sift_sims,
+        frames_rgb,
+        anomaly_threshold,
+        ssim_diff_maps,
+    )
     
     return results
 
-def plot_ultimate_dashboard(results, combined_score, ssim_s, flow_s, vgg_s, frames_rgb, threshold, ssim_diff_maps):
+def plot_ultimate_dashboard(results, combined_score, ssim_s, flow_s, vgg_s, ela_s, sift_s, frames_rgb, threshold, ssim_diff_maps):
     """Membuat dashboard visualisasi canggih dengan Papan Bukti 2x2."""
     fig = plt.figure(figsize=(20, 22))
     gs_main = gridspec.GridSpec(3, 1, height_ratios=[1, 0.8, 2.5], hspace=0.4)
@@ -249,12 +314,20 @@ def plot_ultimate_dashboard(results, combined_score, ssim_s, flow_s, vgg_s, fram
     ax_main.grid(True, linestyle=':')
 
     # Bagian 2: Plot Pilar Analisis
-    gs_pillars = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=gs_main[1], wspace=0.3)
-    ax_ssim, ax_flow, ax_vgg = [fig.add_subplot(gs_pillars[i]) for i in range(3)]
+    gs_pillars = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=gs_main[1], wspace=0.3)
+    ax_ssim = fig.add_subplot(gs_pillars[0])
+    ax_flow = fig.add_subplot(gs_pillars[1])
+    ax_vgg = fig.add_subplot(gs_pillars[2])
+    ax_ela = fig.add_subplot(gs_pillars[3])
+    ax_sift = fig.add_subplot(gs_pillars[4])
     ax_ssim.plot(ssim_s, 'g-'); ax_ssim.set_title('Pilar 1: SSIM'); ax_ssim.set_ylim(0, 1.05)
     ax_flow.plot(flow_s, 'b-'); ax_flow.set_title('Pilar 2: Optical Flow Mag.')
     ax_vgg.plot(vgg_s, 'm-'); ax_vgg.set_title('Pilar 3: VGG16 Sim.'); ax_vgg.set_ylim(0, 1.05)
-    for ax in [ax_ssim, ax_flow, ax_vgg]:
+    ax_ela.plot(ela_s, 'c-'); ax_ela.set_title('Pilar 4: ELA Diff.')
+    ax_sift.plot(sift_s, 'y-'); ax_sift.set_title('Pilar 5: SIFT Sim.')
+    ax_ela.set_ylim(0, max(ela_s)*1.1 if len(ela_s) else 1)
+    ax_sift.set_ylim(0, 1.05)
+    for ax in [ax_ssim, ax_flow, ax_vgg, ax_ela, ax_sift]:
         ax.grid(True, linestyle=':'); ax.set_xlabel('Indeks Transisi')
 
     # Bagian 3: Papan Bukti Visual 2x2
@@ -296,8 +369,11 @@ def plot_ultimate_dashboard(results, combined_score, ssim_s, flow_s, vgg_s, fram
 
         for ax in axes_evidence: ax.axis('off')
 
-        summary_text = (f"BUKTI DISKONTINUITAS TERTINGGI: Transisi Frame {most_suspicious_idx} -> {most_suspicious_idx + 1}\n"
-                        f"Skor Anomali Gabungan: {details['score']:.2f} | SSIM: {details['ssim']:.3f} | Optical Flow: {details['flow']:.2f} | VGG Sim: {details['vgg_sim']:.3f}")
+        summary_text = (
+            f"BUKTI DISKONTINUITAS TERTINGGI: Transisi Frame {most_suspicious_idx} -> {most_suspicious_idx + 1}\n"
+            f"Skor Anomali Gabungan: {details['score']:.2f} | SSIM: {details['ssim']:.3f} | Optical Flow: {details['flow']:.2f} | "
+            f"VGG Sim: {details['vgg_sim']:.3f} | ELA-Diff: {details['ela_diff']:.2f} | SIFT-Sim: {details['sift_sim']:.2f}"
+        )
         fig.text(0.5, 0.92, summary_text, ha='center', fontsize=15, 
                  bbox=dict(boxstyle='round,pad=0.5', fc='yellow', ec='black', lw=1, alpha=0.9))
     else:
