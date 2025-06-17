@@ -331,7 +331,7 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
         ssim_diff_maps,
     )
 
-    generate_pdf_report(results, dashboard_path)
+    generate_pdf_report(results, dashboard_path, frames_rgb, ssim_diff_maps)
 
     return results
 
@@ -429,8 +429,8 @@ def plot_ultimate_dashboard(results, combined_score, ssim_s, flow_s, vgg_s, ela_
     plt.close(fig)
     return output_filename
 
-def generate_pdf_report(results, dashboard_path):
-    """Menyimpan laporan analisis dan dashboard ke dalam satu file PDF."""
+def generate_pdf_report(results, dashboard_path, frames_rgb, ssim_diff_maps):
+    """Menyimpan laporan analisis, gambar bukti, dan dashboard ke PDF."""
     pdf_name = f"laporan_forensik_{os.path.splitext(results['video_file'])[0]}.pdf"
     with PdfPages(pdf_name) as pdf:
         fig_text, ax_text = plt.subplots(figsize=(8.27, 11.69))
@@ -476,6 +476,36 @@ def generate_pdf_report(results, dashboard_path):
             ax_img.axis('off')
             pdf.savefig(fig_img)
             plt.close(fig_img)
+
+        # Halaman bukti duplikasi
+        if results['duplicate_frames']:
+            for dup in results['duplicate_frames'][:3]:
+                f1, f2 = dup['frames']
+                fig_dup, axes_dup = plt.subplots(1, 2, figsize=(8.27, 4))
+                axes_dup[0].imshow(frames_rgb[f1])
+                axes_dup[0].set_title(f'Frame {f1} ({dup["timestamps"][0]:.2f}s)')
+                axes_dup[1].imshow(frames_rgb[f2])
+                axes_dup[1].set_title(f'Frame {f2} ({dup["timestamps"][1]:.2f}s)')
+                for ax in axes_dup:
+                    ax.axis('off')
+                pdf.savefig(fig_dup)
+                plt.close(fig_dup)
+
+        # Halaman bukti anomali
+        if results['anomalies']:
+            sorted_anoms = sorted(results['anomalies'].items(), key=lambda x: x[1]['score'], reverse=True)
+            for idx, info in sorted_anoms[:3]:
+                fig_anom, axes_anom = plt.subplots(1, 3, figsize=(8.27, 4))
+                axes_anom[0].imshow(frames_rgb[idx])
+                axes_anom[0].set_title(f'Frame {idx}\n({info["timestamp_before"]:.2f}s)')
+                axes_anom[1].imshow(frames_rgb[idx+1])
+                axes_anom[1].set_title(f'Frame {idx+1}\n({info["timestamp_after"]:.2f}s)')
+                im = axes_anom[2].imshow(ssim_diff_maps[idx], cmap='viridis')
+                axes_anom[2].set_title('Diff SSIM')
+                for ax in axes_anom:
+                    ax.axis('off')
+                pdf.savefig(fig_anom)
+                plt.close(fig_anom)
 
     logging.info(f"Laporan PDF disimpan sebagai '{pdf_name}'")
 
