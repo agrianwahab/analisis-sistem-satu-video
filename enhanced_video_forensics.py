@@ -26,11 +26,14 @@ from PIL import Image, ImageChops
 import io
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_pdf import PdfPages
 from skimage.metrics import structural_similarity as ssim
 from sklearn.preprocessing import RobustScaler
 from sklearn.cluster import KMeans
 from tqdm import tqdm
 import logging
+import subprocess
+import json
 from datetime import datetime
 
 # --- KONFIGURASI ---
@@ -83,6 +86,25 @@ def compute_sift_similarity(gray1, gray2, ratio=0.75):
     good = [m for m, n in matches if m.distance < ratio * n.distance]
     return len(good) / float(max(len(k1), len(k2)))
 
+def extract_video_metadata(video_path):
+    """Ekstraksi metadata video menggunakan ffprobe jika tersedia."""
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            video_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+    except Exception as e:
+        logging.warning(f"Gagal mengekstrak metadata: {e}")
+        return {}
+
 def detect_scene_transitions(frames, threshold=0.55):
     """Metode deteksi scene change berbasis histogram yang ringan dan cepat."""
     scene_changes = {0}
@@ -117,6 +139,8 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
         return None
     
     logging.info(f"MEMULAI ANALISIS OPTIMIZED UNTUK: {os.path.basename(video_path)}")
+
+    metadata = extract_video_metadata(video_path)
     
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -129,13 +153,17 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
     frames_rgb = []
     frame_hashes = []
     ela_scores = []
+    frame_timestamps = []
     
     for _ in tqdm(range(total_frames), desc="Tahap 1: Ekstraksi Frame & pHash"):
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            break
+        timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         resized_frame = cv2.resize(frame, resize_dim, interpolation=cv2.INTER_AREA)
         frame_rgb = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
         frames_rgb.append(frame_rgb)
+        frame_timestamps.append(timestamp)
         pil_image = Image.fromarray(frame_rgb)
         frame_hashes.append(imagehash.phash(pil_image))
         ela_scores.append(compute_ela_score(frame_rgb))
@@ -230,14 +258,19 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
     
     results = {
         'video_file': os.path.basename(video_path),
+        'metadata': metadata,
         'anomalies': {},
         'duplicate_frames': [],
-        'total_transitions': len(frames_rgb) - 1
+        'total_transitions': len(frames_rgb) - 1,
+        'frame_timestamps': frame_timestamps
     }
     
     for i, dist in enumerate(hamming_dists):
-        if dist <= 1: 
-            results['duplicate_frames'].append((i, i + 1))
+        if dist <= 1:
+            results['duplicate_frames'].append({
+                'frames': (i, i + 1),
+                'timestamps': (frame_timestamps[i], frame_timestamps[i + 1])
+            })
             
     score_median = np.median(combined_anomaly_score)
     score_mad = mad(combined_anomaly_score)
@@ -252,7 +285,9 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
                 'flow': flow_mags[idx],
                 'vgg_sim': vgg_similarities[idx],
                 'ela_diff': ela_diffs[idx],
-                'sift_sim': sift_sims[idx]
+                'sift_sim': sift_sims[idx],
+                'timestamp_before': frame_timestamps[idx],
+                'timestamp_after': frame_timestamps[idx + 1]
             }
 
     # --- TAHAP 5: Pelaporan ---
@@ -262,6 +297,10 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
     
     if results['duplicate_frames']:
         logging.warning(f"DUPLIKASI FRAME TERDETEKSI: {len(results['duplicate_frames'])} kasus ditemukan.")
+        for dup in results['duplicate_frames']:
+            logging.warning(
+                f"    * Duplikasi pada frame {dup['frames'][0]}-{dup['frames'][1]} (t={dup['timestamps'][0]:.2f}s-{dup['timestamps'][1]:.2f}s)"
+            )
     else:
         logging.info("Tidak ada indikasi duplikasi frame.")
         
@@ -275,10 +314,11 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
                 f"  - Transisi Frame {idx} -> {idx+1} [Skor Anomali Gabungan: {details['score']:.2f}]"
                 f" (SSIM={details['ssim']:.2f}, Flow={details['flow']:.2f}, VGG-Sim={details['vgg_sim']:.2f},"
                 f" ELA-Diff={details['ela_diff']:.2f}, SIFT-Sim={details['sift_sim']:.2f})"
+                f" pada t={details['timestamp_before']:.2f}s-{details['timestamp_after']:.2f}s"
             )
     
     # --- TAHAP 6: Visualisasi ---
-    plot_ultimate_dashboard(
+    dashboard_path = plot_ultimate_dashboard(
         results,
         combined_anomaly_score,
         ssim_scores,
@@ -290,7 +330,9 @@ def analyze_video_optimized(video_path, vgg_model, resize_dim=(320, 240), batch_
         anomaly_threshold,
         ssim_diff_maps,
     )
-    
+
+    generate_pdf_report(results, dashboard_path)
+
     return results
 
 def plot_ultimate_dashboard(results, combined_score, ssim_s, flow_s, vgg_s, ela_s, sift_s, frames_rgb, threshold, ssim_diff_maps):
@@ -384,7 +426,58 @@ def plot_ultimate_dashboard(results, combined_score, ssim_s, flow_s, vgg_s, ela_
     output_filename = f"dashboard_forensik_optimized_{os.path.splitext(results['video_file'])[0]}.png"
     plt.savefig(output_filename, dpi=150, bbox_inches='tight')
     logging.info(f"Dashboard analisis visual disimpan sebagai '{output_filename}'")
-    plt.show()
+    plt.close(fig)
+    return output_filename
+
+def generate_pdf_report(results, dashboard_path):
+    """Menyimpan laporan analisis dan dashboard ke dalam satu file PDF."""
+    pdf_name = f"laporan_forensik_{os.path.splitext(results['video_file'])[0]}.pdf"
+    with PdfPages(pdf_name) as pdf:
+        fig_text, ax_text = plt.subplots(figsize=(8.27, 11.69))
+        ax_text.axis('off')
+
+        lines = [
+            f"Laporan Forensik Video",
+            f"File: {results['video_file']}",
+            "",
+            "-- Metadata --",
+        ]
+        for k, v in results['metadata'].get('format', {}).items():
+            lines.append(f"{k}: {v}")
+
+        lines.append("")
+        lines.append("-- Duplikasi Frame --")
+        if results['duplicate_frames']:
+            for dup in results['duplicate_frames']:
+                lines.append(
+                    f"Frame {dup['frames'][0]}-{dup['frames'][1]} pada {dup['timestamps'][0]:.2f}s-{dup['timestamps'][1]:.2f}s"
+                )
+        else:
+            lines.append("Tidak ada duplikasi terdeteksi")
+
+        lines.append("")
+        lines.append("-- Anomali Deteksi --")
+        if results['anomalies']:
+            for idx, info in results['anomalies'].items():
+                lines.append(
+                    f"Transisi {idx}->{idx+1} pada {info['timestamp_before']:.2f}s-{info['timestamp_after']:.2f}s skor={info['score']:.2f}"
+                )
+        else:
+            lines.append("Tidak ada anomali signifikan")
+
+        ax_text.text(0.01, 0.99, "\n".join(lines), va='top')
+        pdf.savefig(fig_text)
+        plt.close(fig_text)
+
+        if os.path.exists(dashboard_path):
+            img = plt.imread(dashboard_path)
+            fig_img, ax_img = plt.subplots(figsize=(8.27, 11.69))
+            ax_img.imshow(img)
+            ax_img.axis('off')
+            pdf.savefig(fig_img)
+            plt.close(fig_img)
+
+    logging.info(f"Laporan PDF disimpan sebagai '{pdf_name}'")
 
 # --- BLOK EKSEKUSI UTAMA ---
 if __name__ == '__main__':
